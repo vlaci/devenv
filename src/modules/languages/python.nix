@@ -10,21 +10,28 @@ let
   );
 
   readlink = "${pkgs.coreutils}/bin/readlink -f ";
-  package = pkgs.callPackage ../../python-wrapper.nix {
-    python = cfg.package;
-    requiredPythonModules = cfg.package.pkgs.requiredPythonModules;
-    makeWrapperArgs = [
-      "--prefix"
-      "LD_LIBRARY_PATH"
-      ":"
-      libraries
-    ] ++ lib.optionals pkgs.stdenv.isDarwin [
-      "--prefix"
-      "DYLD_LIBRARY_PATH"
-      ":"
-      libraries
-    ];
-  };
+
+  auto-patchelf =
+    venv:
+    let
+      drv = pkgs.buildEnv {
+        name = "patchelf";
+        paths = [
+          pkgs.patchelf
+          pkgs.auto-patchelf
+        ];
+      };
+      librariesArgs = lib.replaceStrings [ ":" ] [ " " ] libraries;
+    in
+    ''
+      ${drv}/bin/auto-patchelf \
+        --paths ${venv}/lib ${venv}/bin \
+        --libs ${librariesArgs} \
+        --runtime-dependencies \
+        --append-rpaths \
+        --ignore-missing \
+        --extra-args
+    '';
 
   requirements = pkgs.writeText "requirements.txt" (toString (
     if lib.isPath cfg.venv.requirements
@@ -52,7 +59,7 @@ let
 
       VENV_PATH="${config.env.DEVENV_STATE}/venv"
 
-      profile_python="$(${readlink} ${package.interpreter})"
+      profile_python="$(${readlink} ${cfg.package.interpreter})"
       devenv_interpreter_path="$(${pkgs.coreutils}/bin/cat "$VENV_PATH/.devenv_interpreter" 2> /dev/null || echo false )"
       venv_python="$(${readlink} "$devenv_interpreter_path")"
 
@@ -71,15 +78,15 @@ let
           [ -f "${config.env.DEVENV_STATE}/poetry.lock.checksum" ] && rm ${config.env.DEVENV_STATE}/poetry.lock.checksum
         ''}
         ${if cfg.uv.enable then ''
-          echo uv venv -p ${package.interpreter} "$VENV_PATH"
-          uv venv -p ${package.interpreter} "$VENV_PATH"
+          echo uv venv -p ${cfg.package.interpreter} "$VENV_PATH"
+          uv venv -p ${cfg.package.interpreter} "$VENV_PATH"
         ''
         else ''
-            echo ${package.interpreter} -m venv ${if builtins.isNull cfg.version || lib.versionAtLeast cfg.version "3.9" then "--upgrade-deps" else ""} "$VENV_PATH"
-            ${package.interpreter} -m venv ${if builtins.isNull cfg.version || lib.versionAtLeast cfg.version "3.9" then "--upgrade-deps" else ""} "$VENV_PATH"
+            echo ${cfg.package.interpreter} -m venv ${if builtins.isNull cfg.version || lib.versionAtLeast cfg.version "3.9" then "--upgrade-deps" else ""} "$VENV_PATH"
+            ${cfg.package.interpreter} -m venv ${if builtins.isNull cfg.version || lib.versionAtLeast cfg.version "3.9" then "--upgrade-deps" else ""} "$VENV_PATH"
           ''
         }
-        echo "${package.interpreter}" > "$VENV_PATH/.devenv_interpreter"
+        echo "${cfg.package.interpreter}" > "$VENV_PATH/.devenv_interpreter"
       fi
 
       source "$VENV_PATH"/bin/activate
@@ -101,6 +108,8 @@ let
                   "$VENV_PATH"/bin/pip install -r ${requirements}
                 ''
               }
+
+              ${auto-patchelf "$VENV_PATH"}
          fi
       fi
 
@@ -143,7 +152,7 @@ let
 
       # Avoid running "uv sync" for every shell.
       # Only run it when the "pyproject.toml" file or Python interpreter has changed.
-      local ACTUAL_UV_CHECKSUM="${package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):''${UV_SYNC_COMMAND[@]}"
+      local ACTUAL_UV_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):''${UV_SYNC_COMMAND[@]}"
       local UV_CHECKSUM_FILE="$VENV_PATH/uv.sync.checksum"
       if [ -f "$UV_CHECKSUM_FILE" ]
       then
@@ -157,6 +166,7 @@ let
         if "''${UV_SYNC_COMMAND[@]}"
         then
           echo "$ACTUAL_UV_CHECKSUM" > "$UV_CHECKSUM_FILE"
+          ${auto-patchelf "$VENV_PATH"}
         else
           echo "uv sync failed. Run 'uv sync' manually." >&2
           exit 1
@@ -185,7 +195,7 @@ let
       unset VIRTUAL_ENV
 
       # Make sure poetry's venv uses the configured Python executable.
-      ${cfg.poetry.package}/bin/poetry env use --no-interaction --quiet ${package.interpreter}
+      ${cfg.poetry.package}/bin/poetry env use --no-interaction --quiet ${cfg.package.interpreter}
     }
 
     function _devenv_poetry_install
@@ -194,7 +204,7 @@ let
       # Avoid running "poetry install" for every shell.
       # Only run it when the "poetry.lock" file or Python interpreter has changed.
       # We do this by storing the interpreter path and a hash of "poetry.lock" in venv.
-      local ACTUAL_POETRY_CHECKSUM="${package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):$(${pkgs.nix}/bin/nix-hash --type sha256 poetry.lock):''${POETRY_INSTALL_COMMAND[@]}"
+      local ACTUAL_POETRY_CHECKSUM="${cfg.package.interpreter}:$(${pkgs.nix}/bin/nix-hash --type sha256 pyproject.toml):$(${pkgs.nix}/bin/nix-hash --type sha256 poetry.lock):''${POETRY_INSTALL_COMMAND[@]}"
       local POETRY_CHECKSUM_FILE=".venv/poetry.lock.checksum"
       if [ -f "$POETRY_CHECKSUM_FILE" ]
       then
@@ -208,6 +218,7 @@ let
         if ''${POETRY_INSTALL_COMMAND[@]}
         then
           echo "$ACTUAL_POETRY_CHECKSUM" > "$POETRY_CHECKSUM_FILE"
+          ${auto-patchelf ".venv"}
         else
           echo "Poetry install failed. Run 'poetry install' manually."
           exit 1
@@ -435,7 +446,7 @@ in
 
     cachix.pull = lib.mkIf (cfg.version != null) [ "nixpkgs-python" ];
 
-    packages = [ package ]
+    packages = [ cfg.package ]
       ++ (lib.optional cfg.poetry.enable cfg.poetry.package)
       ++ (lib.optional cfg.uv.enable cfg.uv.package);
 
@@ -484,7 +495,7 @@ in
     };
 
     enterShell = ''
-      export PYTHONPATH="$DEVENV_PROFILE/${package.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
+      export PYTHONPATH="$DEVENV_PROFILE/${cfg.package.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
     '';
   };
 }
